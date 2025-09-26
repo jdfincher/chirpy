@@ -22,6 +22,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	secret         string
 }
 
 type User struct {
@@ -50,6 +51,9 @@ func (cfg *apiConfig) handlerAddUser(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Error: issue decoding json: %s", err)
 	}
 	hPass, err := auth.HashPassword(params.Password)
+	if err != nil {
+		log.Printf("Error: password was not hashed properly: %s", err)
+	}
 	dbParams := database.CreateUserParams{
 		Email:          params.Email,
 		HashedPassword: hPass,
@@ -78,11 +82,13 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 		Email    string `json:"email"`
 	}
+
 	uLogin := new(userLogin)
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(uLogin); err != nil {
 		log.Printf("Error: issue decoding request: %s", err)
 	}
+
 	userDB, err := cfg.db.FindUserByEmail(r.Context(), uLogin.Email)
 	if err != nil {
 		_ = userDB
@@ -96,6 +102,7 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 </html>`+"\n")
 		return
 	}
+
 	err = auth.CheckPassHash(uLogin.Password, userDB.HashedPassword)
 	if err != nil {
 		_ = userDB
@@ -104,17 +111,35 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "Incorrect email or password\n")
 		return
 	}
+
+	lifeSpan := time.Duration(3600) * time.Second
+	tokenString, err := auth.MakeJWT(userDB.ID, cfg.secret, lifeSpan)
+	if err != nil {
+		log.Printf("Error: issue creating JWT: %s\n", err)
+	}
+
 	type userOut struct {
-		ID        uuid.UUID `json:"id"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		Email     string    `json:"email"`
+		ID           uuid.UUID `json:"id"`
+		CreatedAt    time.Time `json:"created_at"`
+		UpdatedAt    time.Time `json:"updated_at"`
+		Email        string    `json:"email"`
+		Token        string    `json:"token"`
+		RefreshToken string    `json:"refresh_token"`
 	}
 	uOut := userOut{
-		ID:        userDB.ID,
-		CreatedAt: userDB.CreatedAt,
-		UpdatedAt: userDB.UpdatedAt,
-		Email:     userDB.Email,
+		ID:           userDB.ID,
+		CreatedAt:    userDB.CreatedAt,
+		UpdatedAt:    userDB.UpdatedAt,
+		Email:        userDB.Email,
+		Token:        tokenString,
+		RefreshToken: auth.MakeRefreshToken(),
+	}
+
+	if err := cfg.db.RecordRefreshToken(r.Context(), database.RecordRefreshTokenParams{
+		Token:  uOut.RefreshToken,
+		UserID: uOut.ID,
+	}); err != nil {
+		log.Printf("Error: issue recording refresh token in database: %s\n", err)
 	}
 	data, err := json.Marshal(uOut)
 	if err != nil {
@@ -135,6 +160,55 @@ func (cfg *apiConfig) handlerAdmin(w http.ResponseWriter, r *http.Request) {
     <p>Chirpy has been visited %d times!</p>
   </body>
 </html>`+"\n", hits)
+}
+
+func (cfg *apiConfig) handlerRefreshToken(w http.ResponseWriter, r *http.Request) {
+	refTokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+	refToken, err := cfg.db.CheckRefreshToken(r.Context(), refTokenString)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+	ok := refToken.ExpiresAt.After(time.Now())
+	if !ok || refToken.RevokedAt.Valid {
+		w.WriteHeader(401)
+		return
+	}
+	tokenString, err := auth.MakeJWT(refToken.UserID, cfg.secret, time.Duration(3600)*time.Second)
+	if err != nil {
+		log.Printf("Error: could not issue new JWT: %s", err)
+	}
+	type tokenOut struct {
+		Token string `json:"token"`
+	}
+	tOut := tokenOut{
+		Token: tokenString,
+	}
+	data, err := json.Marshal(tOut)
+	if err != nil {
+		log.Printf("Error: issue marshalling response data: %s", err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(data)
+}
+
+func (cfg *apiConfig) handlerRevokeToken(w http.ResponseWriter, r *http.Request) {
+	refTokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.WriteHeader(401)
+		return
+	}
+	if err := cfg.db.RevokeToken(r.Context(), refTokenString); err != nil {
+		w.WriteHeader(401)
+		return
+	}
+	w.WriteHeader(204)
 }
 
 func (cfg *apiConfig) handlerResetHits(w http.ResponseWriter, r *http.Request) {
@@ -236,8 +310,8 @@ func (cfg *apiConfig) handlerChirps(w http.ResponseWriter, r *http.Request) {
 		cfg.handlerGetAllChirps(w, r)
 	case "POST":
 		type chirpParams struct {
-			Body   string    `json:"body"`
-			UserID uuid.UUID `json:"user_id"`
+			Body  string `json:"body"`
+			Token string `json:"token"`
 		}
 		decoder := json.NewDecoder(r.Body)
 		params := new(chirpParams)
@@ -245,6 +319,19 @@ func (cfg *apiConfig) handlerChirps(w http.ResponseWriter, r *http.Request) {
 		if err := decoder.Decode(params); err != nil {
 			log.Printf("Error: issue decoding request:%s", err)
 		}
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("%s", err)
+			w.WriteHeader(401)
+			return
+		}
+		id, err := auth.ValidateJWT(token, cfg.secret)
+		if err != nil {
+			log.Printf("%s", err)
+			w.WriteHeader(401)
+			return
+		}
+
 		if len(params.Body) > 140 {
 			params.Body = "Error: chirp over max 140 character length"
 			w.WriteHeader(400)
@@ -258,7 +345,7 @@ func (cfg *apiConfig) handlerChirps(w http.ResponseWriter, r *http.Request) {
 		params.Body = cleanBadWords(params.Body)
 		createParams := database.CreateChirpParams{
 			Body:   params.Body,
-			UserID: params.UserID,
+			UserID: id,
 		}
 		chirp, err := cfg.db.CreateChirp(r.Context(), createParams)
 		if err != nil {
@@ -319,6 +406,7 @@ func main() {
 	cfg := new(apiConfig)
 	cfg.db = database.New(db)
 	cfg.platform = os.Getenv("PLATFORM")
+	cfg.secret = os.Getenv("SECRET")
 
 	fServer := http.StripPrefix("/app", http.FileServer(http.Dir(".")))
 
@@ -332,6 +420,8 @@ func main() {
 	sMux.HandleFunc("/api/chirps", cfg.handlerChirps)
 	sMux.HandleFunc("GET /api/chirps/{chirpID}", cfg.handlerGetChirpByID)
 	sMux.HandleFunc("POST /api/login", cfg.handlerLogin)
+	sMux.HandleFunc("POST /api/refresh", cfg.handlerRefreshToken)
+	sMux.HandleFunc("POST /api/revoke", cfg.handlerRevokeToken)
 	server := &http.Server{
 		Addr:    ":8080",
 		Handler: sMux,
