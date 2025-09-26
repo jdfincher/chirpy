@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -435,6 +436,13 @@ func (cfg *apiConfig) handlerGetAllChirps(w http.ResponseWriter, r *http.Request
 			UserID:    c.UserID,
 		}
 	}
+	sortMethod := r.URL.Query().Get("sort")
+	switch sortMethod {
+	case "asc":
+		sort.Slice(chirpsOut, func(i, j int) bool { return chirpsOut[i].CreatedAt.Before(chirpsOut[j].CreatedAt) })
+	case "desc":
+		sort.Slice(chirpsOut, func(i, j int) bool { return chirpsOut[i].CreatedAt.After(chirpsOut[j].CreatedAt) })
+	}
 	data, err := json.Marshal(chirpsOut)
 	if err != nil {
 		w.WriteHeader(400)
@@ -450,7 +458,51 @@ func (cfg *apiConfig) handlerChirps(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 
 	case "GET":
-		cfg.handlerGetAllChirps(w, r)
+		authorID := r.URL.Query().Get("author_id")
+		if authorID == "" {
+			cfg.handlerGetAllChirps(w, r)
+			return
+		}
+		authorUUID, err := uuid.Parse(authorID)
+		if err != nil {
+			log.Printf("Error: something wrong with author_id: %s\n", err)
+			w.WriteHeader(400)
+			return
+		}
+		chirps, err := cfg.db.GetAllChirpsByAuthor(r.Context(), authorUUID)
+		if err != nil {
+			log.Printf("Error: Could not find chirps based on parsed authorUUID: %s\n", err)
+			w.WriteHeader(404)
+			return
+		}
+
+		type chirpOutParams struct {
+			Body      string    `json:"body"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			ID        uuid.UUID `json:"id"`
+			UserID    uuid.UUID `json:"user_id"`
+		}
+
+		chirpsOut := make([]chirpOutParams, len(chirps))
+
+		for i := range chirps {
+			chirpsOut[i] = chirpOutParams{
+				Body:      chirps[i].Body,
+				CreatedAt: chirps[i].CreatedAt,
+				UpdatedAt: chirps[i].UpdatedAt,
+				ID:        chirps[i].ID,
+				UserID:    chirps[i].UserID,
+			}
+		}
+
+		data, err := json.Marshal(&chirpsOut)
+		if err != nil {
+			log.Printf("Error: issue marshalling data for response: %s\n", err)
+		}
+		w.WriteHeader(200)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
 
 	case "POST":
 		type chirpParams struct {
